@@ -230,6 +230,14 @@ LOCAL_C_INCLUDES += \
 	$(TOP)/hardware/samsung/exynos4/include
 endif
 
+ifeq ($(BOARD_USES_MRVL_HARDWARE), true)
+LOCAL_CFLAGS += -DMRVL_HARDWARE
+LOCAL_C_INCLUDES += \
+        $(TOP)/hardware/marvell/gralloc \
+        $(TOP)/hardware/libhardware/include/hardware \
+        $(TOP)/hardware/marvell/ipplib/openmax/include
+endif
+
 # FFMPEG plugin
 LOCAL_C_INCLUDES += \
 	$(TOP)/external/stagefright-plugins/include

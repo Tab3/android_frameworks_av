@@ -58,6 +58,9 @@ namespace android {
 
 struct MediaCodecInfo;
 class MemoryDealer;
+#ifdef MRVL_HARDWARE
+class MemoryHeapBase;
+#endif
 struct OMXCodecObserver;
 struct CodecProfileLevel;
 class SkipCutBuffer;
@@ -130,6 +133,12 @@ struct OMXCodec : public MediaSource,
         kOutputBuffersAreUnreadable           = 4096,
         kRequiresGlobalFlush                  = 0x20000000, // 2^29
         kRequiresWMAProComponent              = 0x40000000, //2^30
+
+#ifdef MRVL_HARDWARE
+        kAvoidMemcopyInputRecordingFrames     = 8192,
+        kRequiresBufferPhysicalContinuousOnInputPorts   = 134217728,
+        kRequiresBufferPhysicalContinuousOnOutputPorts  = 268435456,
+#endif
     };
 
     struct CodecNameAndQuirks {
@@ -167,6 +176,10 @@ private:
 
     // Call this with mLock hold
     void on_message(const omx_message &msg);
+
+#ifdef MRVL_HARDWARE
+    status_t initOutputBufferInfo();
+#endif
 
     enum State {
         DEAD,
@@ -237,6 +250,9 @@ private:
     size_t mCodecSpecificDataIndex;
 
     sp<MemoryDealer> mDealer[2];
+#ifdef MRVL_HARDWARE
+    sp<MemoryHeapBase> mIOMXHeap[2];
+#endif
 
     State mState;
     Vector<BufferInfo> mPortBuffers[2];

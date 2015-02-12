@@ -202,6 +202,10 @@ enum {
     // Indicate if it is OK to hold on to the MediaBuffer and not
     // release it immediately
     kKeyCanDeferRelease   = 'drel', // bool (int32_t)
+
+#ifdef MRVL_HARDWARE
+    kKey263AdvancedFeatures = '263A', // Indicate H.263 has advanced features.
+#endif
 };
 
 enum {

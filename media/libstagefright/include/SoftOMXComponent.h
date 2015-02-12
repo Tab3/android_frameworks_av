@@ -165,6 +165,15 @@ private:
             OMX_HANDLETYPE component,
             OMX_STATETYPE *state);
 
+#ifdef MRVL_HARDWARE
+    static OMX_ERRORTYPE GetComponentVersionWrapper(
+        OMX_HANDLETYPE hComponent,
+        OMX_STRING pComponentName,
+        OMX_VERSIONTYPE* pComponentVersion,
+        OMX_VERSIONTYPE* pSpecVersion,
+        OMX_UUIDTYPE* pComponentUUID);
+#endif
+
     DISALLOW_EVIL_CONSTRUCTORS(SoftOMXComponent);
 };
 

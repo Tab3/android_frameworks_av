@@ -69,6 +69,9 @@
 
 #include <binder/IServiceManager.h>
 #include <binder/MemoryDealer.h>
+#ifdef MRVL_HARDWARE
+#include <binder/MemoryBase.h>
+#endif
 #include <binder/ProcessState.h>
 #include <HardwareAPI.h>
 #include <media/stagefright/foundation/ADebug.h>
@@ -122,6 +125,12 @@
 #ifdef USE_S3D_SUPPORT
 #include "Exynos_OMX_Def.h"
 #include "ExynosHWCService.h"
+#endif
+
+#ifdef MRVL_HARDWARE
+#include "gralloc_priv.h"
+#include "gralloc.h"
+#include "OMX_IppDef.h"
 #endif
 
 namespace android {
@@ -269,6 +278,35 @@ static bool IsSoftwareCodec(const char *componentName) {
         return true;
     }
 #endif // DOLBY_END
+#ifdef MRVL_HARDWARE
+    if (!strcmp("OMX.MARVELL.VIDEO.H264DECODER", componentName)) {
+        return true;
+    }
+
+    if (!strcmp("OMX.MARVELL.VIDEO.MPEG4ASPDECODER", componentName)) {
+        return true;
+    }
+
+    if (!strcmp("OMX.MARVELL.VIDEO.H263DECODER", componentName)) {
+        return true;
+    }
+
+    if (!strcmp("OMX.MARVELL.VIDEO.WMVDECODER", componentName)) {
+        return true;
+    }
+
+    if (!strcmp("OMX.MARVELL.VIDEO.H264ENCODER", componentName)) {
+        return true;
+    }
+
+    if (!strcmp("OMX.MARVELL.VIDEO.MPEG4ENCODER", componentName)) {
+        return true;
+    }
+
+    if (!strcmp("OMX.MARVELL.VIDEO.H263ENCODER", componentName)) {
+        return true;
+    }
+#endif
     if (!strncmp("OMX.google.", componentName, 11)
         || !strncmp("OMX.ffmpeg.", componentName, 11)) {
         return true;
@@ -429,6 +467,11 @@ uint32_t OMXCodec::getComponentQuirks(
         quirks |= kRequiresFlushCompleteEmulation;
     }
 #endif // DOLBY_END
+#ifdef MRVL_HARDWARE
+    if (info->hasQuirk("avoid-memcpy-input-recording-frames")) {
+        quirks |= kAvoidMemcopyInputRecordingFrames;
+    }
+#endif
 
     return quirks;
 }
@@ -500,6 +543,17 @@ sp<MediaSource> OMXCodec::Create(
                 mime, createEncoder ? "true" : "false", matchComponentName, flags);
         return NULL;
     }
+
+#ifdef MRVL_HARDWARE
+    int has263AdvFeatures = -1;
+    if (!strcmp(mime,MEDIA_MIMETYPE_VIDEO_H263)) {
+        if (meta->findInt32(kKey263AdvancedFeatures, &has263AdvFeatures)) {
+            ALOGD("H.263 has advanced features: %d", has263AdvFeatures);
+        } else {
+            ALOGD("Could not get H.263 advanced feature info.");
+        }
+    }
+#endif
 
     sp<OMXCodecObserver> observer = new OMXCodecObserver;
     IOMX::node_id node = 0;
@@ -883,7 +937,13 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
         int32_t numChannels;
         CHECK(meta->findInt32(kKeyChannelCount, &numChannels));
 
-        setG711Format(numChannels);
+#ifdef MRVL_HARDWARE
+        int32_t sampleRate;
+        CHECK(meta->findInt32(kKeySampleRate, &sampleRate));
+        setRawAudioFormat(kPortIndexInput, sampleRate, numChannels);
+#else
+        setG711Format(numChannels); 
+#endif
     } else if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_RAW, mMIME)) {
         CHECK(!mIsEncoder);
 
@@ -954,6 +1014,23 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
     if (meta->findInt32(kKeyMaxInputSize, &maxInputSize)) {
         setMinBufferSize(kPortIndexInput, (OMX_U32)maxInputSize);
     }
+#ifdef MRVL_HARDWARE
+    else if(!mIsEncoder && !strncasecmp(mMIME, "video/", 6)) {
+        //if extractor couldn't provide kKeyMaxInputSize information, need estimate max size according to resolution because most of mrvl omx dec il set ~300kB as input port size, which isn't enough for some stream.
+        int32_t width=640, height=480;//init a default width and height, findInt32(kKeyWidth, ) will update it
+        meta->findInt32(kKeyWidth, &width);
+        meta->findInt32(kKeyHeight, &height);
+
+        //Estimate the Max input sample size as 0.75 * resolution.
+        int32_t EstimatedMaxInputSize = (width * height * 3) >> 2;
+
+        //Limit the size into [4K, 1.5M]
+        if (EstimatedMaxInputSize < (1 << 12)) EstimatedMaxInputSize = 4096;
+        if (EstimatedMaxInputSize > (1 << 20) * 3/2) EstimatedMaxInputSize = (1 << 20) * 3/2;
+
+        setMinBufferSize(kPortIndexInput, EstimatedMaxInputSize);
+    }
+#endif
 
     initOutputFormat(meta);
 
@@ -986,6 +1063,48 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
         mQuirks &= ~kOutputBuffersAreUnreadable;
     }
 
+#ifdef MRVL_HARDWARE
+    if (!strncmp(mComponentName, "OMX.MARVELL.VIDEO.HW.CODA7542", 18)) {
+        if (!mOMXLivesLocally) {
+            //when cross-process, avoid memcpy through client and component.
+            mQuirks &= ~ kRequiresAllocateBufferOnOutputPorts;
+            mQuirks &= ~ kRequiresAllocateBufferOnInputPorts;
+            CODEC_LOGI("In cross-process usage, remove quirk kRequiresAllocateBufferOnInputPorts/OutputPorts to avoid memcpy.");
+        }
+
+        {
+            OMX_PARAM_PORTDEFINITIONTYPE def;
+            InitOMXParams(&def);
+
+            def.nPortIndex = kPortIndexOutput;
+            status_t err = mOMX->getParameter(
+                    mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
+
+            if (err != OK) {
+                return err;
+            }
+
+            if (OMX_TRUE == def.bBuffersContiguous) {
+                mQuirks |= kRequiresBufferPhysicalContinuousOnOutputPorts;
+                CODEC_LOGI("add quirk kRequiresBufferPhysicalContinuousOnOutputPorts");
+            }
+
+            def.nPortIndex = kPortIndexInput;
+            err = mOMX->getParameter(
+                    mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
+
+            if (err != OK) {
+                return err;
+            }
+
+            if (OMX_TRUE == def.bBuffersContiguous) {
+                mQuirks |= kRequiresBufferPhysicalContinuousOnInputPorts;
+                CODEC_LOGI("add quirk kRequiresBufferPhysicalContinuousOnInputPorts");
+            }
+        }
+    }
+#endif
+
     if (mNativeWindow != NULL
         && !mIsEncoder
         && !strncasecmp(mMIME, "video/", 6)
@@ -994,6 +1113,9 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
         if (err != OK) {
             return err;
         }
+#ifdef MRVL_HARDWARE
+        initOutputBufferInfo();
+#endif
     }
 
     return OK;
@@ -1833,6 +1955,18 @@ OMXCodec::OMXCodec(
     mPortStatus[kPortIndexInput] = ENABLING;
     mPortStatus[kPortIndexOutput] = ENABLING;
 
+
+#ifdef MRVL_HARDWARE
+    if(!mOMXLivesLocally){
+        //In case of cross-process, we use memcpy for buffer transfering, e.g.: the VideoEditor encoding case
+        if ((strcmp(componentName, "OMX.MARVELL.VIDEO.HW.CODA7542ENCODER") == 0))
+        {
+            mQuirks &= ~kAvoidMemcopyInputRecordingFrames;
+            mQuirks |= kRequiresAllocateBufferOnInputPorts;
+        }
+    }
+#endif
+
     setComponentRole();
 }
 
@@ -1995,6 +2129,10 @@ status_t OMXCodec::init() {
 
     err = allocateBuffers();
     if (err != (status_t)OK) {
+#ifdef MRVL_HARDWARE
+        freeBuffersOnPort(kPortIndexInput, true /* onlyThoseWeOwn */);
+        freeBuffersOnPort(kPortIndexOutput, true /* onlyThoseWeOwn */);
+#endif
         return err;
     }
 
@@ -2069,21 +2207,57 @@ status_t OMXCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
         return err;
     }
 
+#ifdef MRVL_HARDWARE
+    size_t defBufSzActual = (def.nBufferSize+getpagesize()-1)&~(getpagesize()-1);//getpagesize() return 4096 currently
+    CODEC_LOGI("allocating %lu buffers of size %lu(actual sz %lu) on %s port",
+            def.nBufferCountActual, def.nBufferSize, defBufSzActual,
+#else
     CODEC_LOGI("allocating %lu buffers of size %lu on %s port",
             def.nBufferCountActual, def.nBufferSize,
+#endif
             portIndex == kPortIndexInput ? "input" : "output");
 
 #ifdef MTK_HARDWARE
     OMX_U32 memoryAlign = 32;
     size_t totalSize = def.nBufferCountActual *
         ((def.nBufferSize + (memoryAlign - 1))&(~(memoryAlign - 1)));
+#elif defined(MRVL_HARDWARE)
+    //do nothing
 #else
     size_t totalSize = def.nBufferCountActual * def.nBufferSize;
 #endif
+#ifdef MRVL_HARDWARE
+    size_t totalSize = def.nBufferCountActual * defBufSzActual;
+    if ((!strncmp(mComponentName, "OMX.MARVELL.VIDEO.HW.CODA7542", 18))
+        && (((portIndex == kPortIndexOutput) && (mQuirks & kRequiresBufferPhysicalContinuousOnOutputPorts) && !(mQuirks & kRequiresAllocateBufferOnOutputPorts))
+        || ((portIndex == kPortIndexInput) && (mQuirks & kRequiresBufferPhysicalContinuousOnInputPorts) && !(mQuirks & kRequiresAllocateBufferOnInputPorts)))){
+        sp<MemoryHeapBase> heap = new MemoryHeapBase("/dev/ion", totalSize, MemoryHeapBase::NO_CACHING);
+        if (heap->heapID() < 0) {
+            CODEC_LOGE("Failed to allocate ion memory from %s", "/dev/ion");
+            return UNKNOWN_ERROR;
+        } else {
+            mIOMXHeap[portIndex] = heap;
+        }
+    } else {
+        mDealer[portIndex] = new MemoryDealer(totalSize, "OMXCodec");
+    }
+#else
     mDealer[portIndex] = new MemoryDealer(totalSize, "OMXCodec");
+#endif
 
     for (OMX_U32 i = 0; i < def.nBufferCountActual; ++i) {
-        sp<IMemory> mem = mDealer[portIndex]->allocate(def.nBufferSize);
+        sp<IMemory> mem;
+#ifdef MRVL_HARDWARE
+        if ((!strncmp(mComponentName, "OMX.MARVELL.VIDEO.HW.CODA7542", 18))
+            && (((portIndex == kPortIndexOutput) && (mQuirks & kRequiresBufferPhysicalContinuousOnOutputPorts) && !(mQuirks & kRequiresAllocateBufferOnOutputPorts))
+            || ((portIndex == kPortIndexInput) && (mQuirks & kRequiresBufferPhysicalContinuousOnInputPorts) && !(mQuirks & kRequiresAllocateBufferOnInputPorts)))){
+            mem = new MemoryBase(mIOMXHeap[portIndex], i * defBufSzActual, defBufSzActual);
+        } else {
+            mem = mDealer[portIndex]->allocate(def.nBufferSize);
+        }
+#else
+        mem = mDealer[portIndex]->allocate(def.nBufferSize);
+#endif
         CHECK(mem.get() != NULL);
 
         BufferInfo info;
@@ -2274,6 +2448,27 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
             frameWidth,
             frameHeight,
             def.format.video.eColorFormat);
+#elif defined(MRVL_HARDWARE)
+    int halFmt = 0;
+    //remapping the color format for mrvl native window implementation
+    if(OMX_COLOR_FormatYUV420Planar == def.format.video.eColorFormat){
+        halFmt = HAL_PIXEL_FORMAT_YCbCr_420_P;  // YUV420
+        ALOGI("Native Window Buffer Geometry %lu.%lu - OMX_COLOR_FormatYUV420Planar", def.format.video.nFrameWidth, def.format.video.nFrameHeight);
+    }else if(OMX_COLOR_FormatYUV420SemiPlanar == def.format.video.eColorFormat){
+        halFmt = HAL_PIXEL_FORMAT_YCbCr_420_SP_MRVL; // NV12
+        ALOGI("Native Window Buffer Geometry %lu.%lu - OMX_COLOR_FormatYUV420SemiPlanar", def.format.video.nFrameWidth, def.format.video.nFrameHeight);
+    }else if(OMX_COLOR_FormatCbYCrY == def.format.video.eColorFormat){
+        halFmt = HAL_PIXEL_FORMAT_CbYCrY_422_I;     // UYVY
+        ALOGI("Native Window Buffer Geometry %lu.%lu - OMX_COLOR_FormatCbYCrY", def.format.video.nFrameWidth, def.format.video.nFrameHeight);
+    }else{
+        ALOGE("Not support/mapped color format %d!!!", def.format.video.eColorFormat);
+    }
+
+    err = native_window_set_buffers_geometry(
+            mNativeWindow.get(),
+            def.format.video.nFrameWidth,
+            def.format.video.nFrameHeight,
+            halFmt);
 #else
     err = native_window_set_buffers_geometry(
             mNativeWindow.get(),
@@ -2761,6 +2956,15 @@ void OMXCodec::on_message(const omx_message &msg) {
 
             // Buffer could not be released until empty buffer done is called.
             if (info->mMediaBuffer != NULL) {
+#ifdef MRVL_HARDWARE
+                if (mIsEncoder &&
+                    (mQuirks & kAvoidMemcopyInputRecordingFrames)) {
+                    // If zero-copy mode is enabled this will send the
+                    // input buffer back to the upstream source.
+                    OMX_BUFFERHEADERTYPE *header = (OMX_BUFFERHEADERTYPE *)info->mBuffer;
+                    header->pBuffer = (OMX_U8 *)info->mData;
+                }
+#endif
                 info->mMediaBuffer->release();
                 info->mMediaBuffer = NULL;
             }
@@ -3039,6 +3243,9 @@ void OMXCodec::onEvent(OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2) {
 
                 sp<MetaData> oldOutputFormat = mOutputFormat;
                 initOutputFormat(mSource->getFormat());
+#ifdef MRVL_HARDWARE
+                initOutputBufferInfo();
+#endif
 
                 if (data2 == OMX_IndexConfigCommonOutputCrop &&
                     formatHasNotablyChanged(oldOutputFormat, mOutputFormat)) {
@@ -3167,6 +3374,9 @@ void OMXCodec::onCmdComplete(OMX_COMMANDTYPE cmd, OMX_U32 data) {
 
                 sp<MetaData> oldOutputFormat = mOutputFormat;
                 initOutputFormat(mSource->getFormat());
+#ifdef MRVL_HARDWARE
+                initOutputBufferInfo();
+#endif
 
                 // Don't notify clients if the output port settings change
                 // wasn't of importance to them, i.e. it may be that just the
@@ -3862,13 +4072,35 @@ bool OMXCodec::drainInputBuffer(BufferInfo *info) {
                             + srcBuffer->range_offset(),
                         srcBuffer->range_length());
             }
+#elif defined(MRVL_HARDWARE)
+            CHECK(srcBuffer->data() != NULL) ;
+            if (mIsEncoder && (mQuirks & kAvoidMemcopyInputRecordingFrames)) {
+                CHECK(mOMXLivesLocally && offset == 0);
+
+                OMX_BUFFERHEADERTYPE *header =
+                    (OMX_BUFFERHEADERTYPE *)info->mBuffer;
+
+                CHECK(header->pBuffer == info->mData);
+
+                header->pBuffer =
+                    (OMX_U8 *)srcBuffer->data() + srcBuffer->range_offset();
+
+                releaseBuffer = false;
+                void *ptr = NULL;
+                info->mMediaBuffer = srcBuffer;
+            } else {
+                memcpy((uint8_t *)info->mData + offset,
+                        (const uint8_t *)srcBuffer->data()
+                            + srcBuffer->range_offset(),
+                        srcBuffer->range_length());
+            }
 #else
             CHECK(srcBuffer->data() != NULL) ;
             memcpy((uint8_t *)info->mData + offset,
                     (const uint8_t *)srcBuffer->data()
                         + srcBuffer->range_offset(),
                     srcBuffer->range_length());
-#endif // USE_SAMSUNG_COLORFORMAT
+#endif
         }
 
         int64_t lastBufferTimeUs;
@@ -4989,6 +5221,44 @@ void OMXCodec::initNativeWindowCrop() {
     // already invalid, we'll know soon enough.
     native_window_set_crop(mNativeWindow.get(), &crop);
 }
+
+#ifdef MRVL_HARDWARE
+status_t OMXCodec::initOutputBufferInfo(){
+    if (mNativeWindow == NULL){
+        return UNKNOWN_ERROR;
+    }
+    OMX_PARAM_PORTDEFINITIONTYPE def;
+    InitOMXParams(&def);
+    def.nPortIndex = kPortIndexOutput;
+
+    status_t err = mOMX->getParameter(
+            mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
+    if (err != OK) {
+        return err;
+    }
+    int minUndequeuedBufs = 0;
+    err = mNativeWindow->query(mNativeWindow.get(),
+            NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS, &minUndequeuedBufs);
+    if (err != 0) {
+        ALOGE("NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS query failed: %s (%d)",
+                strerror(-err), -err);
+        return err;
+    }
+
+    if (def.nBufferCountActual < def.nBufferCountMin + minUndequeuedBufs) {
+        OMX_U32 newBufferCount = def.nBufferCountMin + minUndequeuedBufs;
+        def.nBufferCountActual = newBufferCount;
+        err = mOMX->setParameter(
+                mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
+        if (err != OK) {
+            CODEC_LOGE("setting nBufferCountActual to %lu failed: %d",
+                    newBufferCount, err);
+            return err;
+        }
+    }
+    return OK;
+}
+#endif
 
 void OMXCodec::initOutputFormat(const sp<MetaData> &inputFormat) {
     mOutputFormat = new MetaData;

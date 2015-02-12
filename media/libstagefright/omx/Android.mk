@@ -37,6 +37,18 @@ ifeq ($(DTS_CODEC_M_), true)
   LOCAL_CFLAGS += -DDTS_CODEC_M_
 endif
 
+
+ifeq ($(BOARD_USES_MRVL_HARDWARE), true)
+LOCAL_CFLAGS += -DMRVL_HARDWARE
+LOCAL_C_INCLUDES += \
+        $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include \
+        $(TOP)/hardware/marvell/gralloc \
+        $(TOP)/hardware/libhardware/include/hardware \
+        $(TOP)/hardware/marvell/ipplib/openmax/include
+LOCAL_ADDITIONAL_DEPENDENCIES := \
+        $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
+endif
+
 LOCAL_MODULE:= libstagefright_omx
 
 include $(BUILD_SHARED_LIBRARY)
